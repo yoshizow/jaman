@@ -1,0 +1,486 @@
+#!/bin/sh
+# jaman - Java API Manual Viewer
+# version 1.0.0
+#
+# Copyright (c) 2002-2012, MAKISE Yoshitaro. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person
+# obtaining a copy of this software and associated documentation files
+# (the "Software"), to deal in the Software without restriction,
+# including without limitation the rights to use, copy, modify, merge,
+# publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so,
+# subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+# BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+# ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+defaultpath=/usr/local/jdk/docs/ja/api
+
+NAWK=gawk
+GREP=grep
+SED=sed
+GZIPCMD=gzip
+
+DEFAULT_SHOW_CANDIDATES_MAX=20
+CACHE_DIR=$HOME/.jaman.cache
+
+WORD_BEGIN='[ ./#]'
+WORD_END='\($\|[./#]\)'
+WORD_SEP='[./#]'
+WORD='[A-Za-z0-9_][A-Za-z0-9_]*'
+
+
+cygwin=0
+case "`uname`" in
+    CYGWIN*) cygwin=1 ;;
+esac
+
+quote_regexp() {
+    echo "$1" | $SED 's|\.|[./#]|g'
+}
+
+absolute_path() {
+    path="$1"
+    case "$path" in
+       /*) ;;
+       *)  path="`pwd`/$1"
+    esac
+    echo "$path" |
+      $SED -n '
+:loop
+s,/[^/]*/\.\./,/,g
+s,/[^/]*/\.\.$,,g
+s,\(/[^/]*\)/\./,\1/,g
+s,\(/[^/]*\)/\.$,\1,g
+s,^/\.\.$,/,
+s,^/\.\./,/,
+s,^$,/,
+t loop
+p'
+}
+
+canonicalize_path() {
+    if [ -d "$1" ] ; then
+        ( cd "$1" ; /bin/pwd )
+    else
+        d=`dirname "$1"`
+        echo `canonicalize_path "$d"`/`basename "$1"`
+    fi
+}
+
+# Returns true if file $1 is newer than file $2.
+# Return value is undefined if file $1 or $2 does not exist.
+newer() {
+    test -n "`find $1 -newer $2 -print 2>/dev/null`"
+}
+
+my_browse() {
+    if [ "$cgioutput" -eq 1 ] ; then
+        echo "$1"
+    else
+        browse "$1"
+#        mozilla -remote "openURL($1)" || { mozilla "$1" & }
+    fi
+}
+
+# Extract n-th path.
+# arg: $1: n
+# arg: $2: path
+nth_path() {
+    n=$1 ;  p=$2
+
+    old_IFS="$IFS" ; IFS=:
+    set x $p ; shift
+    IFS="$old_IFS"
+    eval d=\${$n}
+    test -n "$d" || d=.
+
+    echo "$d"
+}
+
+get_srcpath() {
+    echo ${JAMANPATH:-$defaultpath}
+}
+
+usage() {
+    cat <<__EOF__
+usage: $0 [option...] <pattern>...
+option:
+  -path <path>  Specify search path for javadocs
+  -i            Perform case-insensitive search
+  -c            Perform case-sensitive search
+  -s <n>, -show-candidates-max <n>
+                Specify the limit of the number of candidates
+                displayed without omitting. If 'all' is specified,
+                show all candidates. Default of <n> is 20.
+__EOF__
+}
+
+# Create list of class/member names from a javadoc placed in
+# directory $1.
+# Each line of the list is in the form like:
+# <class name>
+#   or
+# <class name>#<member name>
+create_entry_list() {
+    dir="$1"
+
+    if [ -r "$dir/index-all.html" -o -d "$dir/index-files" ] ; then
+        # Each line looks like:
+        # <dt><span class="strong"><a href="../java/util/Arrays.html#sort(int[])">sort(int[])</a></span> - Static method in class java.util.<a href="../java/util/Arrays.html" title="class in java.util">Arrays</a></dt>
+        cat "$dir/index-all.html" "$dir/index-files/"*.html 2>/dev/null |
+        $SED 's/<dt>/\
+<dt>/g' |      # A portable way to specify newline in the replacement string of sed s command. ugly...
+        $NAWK '/^<dt>(<span[^>]*>)?<a href="/ {
+                sub(/^<dt>(<span[^>]*>)?<a href="(..\/)?/, "")
+                sub(/(\(|").*$/, "")
+                sub(/\.html$/, "")
+                sub(/\.html#/, "#")
+                print
+              }' |
+        $GREP -v '\(^\|/\)\([A-Za-z0-9_.][A-Za-z0-9_.]*\)#\2$' |  # remove ctor
+        $GREP -v 'package-summary'
+    elif [ -r "$dir/allclasses-frame.html" ] ; then
+        cat "$dir/allclasses-frame.html" |
+        $NAWK '/^.*<A HREF="[^"]*\.html" TARGET="classFrame">/ {
+                sub(/^.*<A HREF="/, "")
+                sub(/\.html" TARGET="classFrame">.*$/, "")
+                print
+              }'
+    fi | sort -u
+}
+
+# Get total list of class/member name.
+# Each line of the list is in the form like:
+# <index in search path> <class name>
+#   or
+# <index in search path> <class name>#<member name>
+# When cache exists and it is new, use it. Otherwise create new one.
+get_entry_list() {
+    cnt=1
+    old_IFS="$IFS" ; IFS=:
+    for dir in $srcpath; do
+        test -n "$dir" || dir=.
+
+        if [ -r "$dir/allclasses-frame.html" ] ; then
+            dir=`canonicalize_path "$dir"`
+            cache=$CACHE_DIR/`echo $dir | $SED 's,/,_,g'`.gz
+
+            if [ ! -r "$cache" ] || newer "$dir/index.html" "$cache" ; then
+                echo "generating index: ${dir} ..." 1>&2
+                mkdir -p "$CACHE_DIR"
+                create_entry_list "$dir" | $GZIPCMD -1c > "$cache"
+            fi
+
+            $GZIPCMD -dc "$cache" | $SED "s/^/${cnt} /"
+        fi
+
+        cnt=`expr $cnt + 1`
+    done
+    IFS="$old_IFS"
+}
+
+# Get the URL of the document which describes specified class or member.
+# arg: $1: index in search path
+#      $2: <class name> or <class name>#<member name>
+# ret: URL
+entry_to_url() {
+    idx=$1
+    entry=$2
+
+    old_IFS="$IFS" ; IFS=#
+    set x $entry
+    IFS="$old_IFS"
+    class=$2
+    member=$3
+
+    dir="`nth_path $idx \"$srcpath\"`"
+
+    file="${dir}/${class}.html"
+    file=`absolute_path "$file"`
+
+    if [ ! -f "$file" ] ; then
+        echo "error: file '${file}' not found for entry '${entry}'" 1>&2
+        return
+    fi
+
+    if [ -n "$member" ] ; then
+        # If member exists, use first member found.
+        member='#'`cat "$file" | $SED -n "/<a name=\"${member}\>/{ s/^[^\"]*\"\\([^\"]*\\)\"[^\"]*$/\\1/; p; q; }"`
+    fi
+
+    if [ $cygwin -eq 1 ] ; then
+        file=///`cygpath -m "$file"`
+    fi
+
+    echo "file:${file}${member}"
+}
+
+# View the manual of the specified class or member.
+# arg: $1: index in search path
+#      $2: <class name> or <class name>#<member name>
+view_entry() {
+    [ "$cgioutput" -eq 0 ] && echo "Found entry '`echo $2 | tr / .`'; showing..."
+    url=`entry_to_url $1 $2`
+    if [ -n "$url" ] ; then
+        my_browse "$url"
+    fi
+}
+
+# View matching entries through html.
+# arg: $1: file name of the entry list
+#      $2: title message
+view_matchings() {
+    f=$1
+    title=$2
+    set `wc -l < $f`
+
+    if [ "$1" -gt $candmax ] ; then
+	echo "Found $1 `echo $title | tr A-Z a-z`. Display omitted."
+	return
+    fi
+
+    if [ "$cgioutput" -eq 0 ] ; then
+	echo "Found $1 `echo $title | tr A-Z a-z`; showing..."
+
+	create_list_html "$f" "$title" > $listhtml
+
+	if [ $cygwin -eq 1 ] ; then
+	    file=///`cygpath -m "$listhtml"`
+	else
+	    file="$listhtml"
+	fi
+	my_browse "file:${file}"
+    else
+	create_list_html "$f" "$title"
+    fi
+}
+
+# Create html file used by view_matchings().
+# arg: $1: file name of the entry list
+#      $2: title message
+create_list_html() {
+    f=$1
+    title=$2
+
+    cat <<__EOF__
+<html><head><title>${title}</title></head><body>
+<p>${title}:</p><ul>
+__EOF__
+
+    while read idx entry; do
+        url=`entry_to_url $idx $entry`
+        if [ -n "$url" ] ; then
+            echo "<li><a href=\"${url}\"><code>`echo $entry | tr / .`</code></a></li>"
+        fi
+    done < $f
+
+    cat <<'__EOF__'
+</ul></body></html>
+__EOF__
+}
+
+# Show candidates if needed.
+# $1: file name
+# $2: message
+show_candidates() {
+    f=$1
+    msg=$2
+    set `wc -l < $f`        # to remove white space
+    if [ "$1" -gt $candmax ] ; then
+       echo "There are $1 ${msg}. Display omitted."
+    else
+       echo "There are $1 ${msg}:"
+       $NAWK '{ gsub(/\//, ".", $2); print $2 }' $f
+    fi
+}
+
+clean_exit() {
+    rm -f $entrylist $grepout
+    exit $1
+}
+
+patterns=
+srcpath="`get_srcpath`"
+ignorecase=-i
+casespec=0
+candmax=$DEFAULT_SHOW_CANDIDATES_MAX
+cgioutput=0
+while [ -n "$1" ] ; do
+    case "$1" in
+      -path|--path)
+          shift
+          srcpath="$1"
+          if [ -z "$srcpath" ] ; then usage ; exit 2 ; fi
+          ;;
+      -i)
+          ignorecase=-i
+          casespec=1
+          ;;
+      -c)
+          ignorecase=
+          casespec=1
+          ;;
+      -s|-show-candidates-max|--show-candidates-max)
+          shift
+          candmax="$1"
+          if [ -z "$candmax" ] ; then usage ; exit 2 ; fi
+	  case "$candmax" in
+	    [Aa][Ll][Ll])
+	      candmax=999999999 ;;
+	    *)
+	      if echo "$candmax" | $GREP '[^0-9]' > /dev/null; then
+                  echo "Neither number nor 'all': $1" 1>&2
+                  exit 2
+              fi
+	      ;;
+	  esac
+          ;;
+      -cgi-output)
+          cgioutput=1
+          ;;
+      -*)
+          usage
+          exit 2
+          ;;
+      *)
+          if echo "$1" | $GREP '[^A-Za-z0-9_.#]' > /dev/null; then
+              echo "Bad pattern: $1" 1>&2
+              exit 2
+          fi
+          if [ -z "$patterns" ] ; then
+              patterns="$1"
+          else
+              patterns="$patterns $1"
+          fi
+          ;;
+    esac
+    shift
+done
+
+if [ -z "$patterns" ] ; then
+    usage
+    exit 2
+fi
+
+if [ "$casespec" -eq 0 ] &&
+    echo "$patterns" | $GREP '[A-Z]' > /dev/null ; then
+    ignorecase=
+fi
+
+entrylist=/tmp/jasv.$$.1
+grepout=/tmp/jasv.$$.2
+listhtml=$CACHE_DIR/candidates_tmp.html
+trap "clean_exit 2" 1 2 3 15
+
+# Build pattern.
+patterns=`quote_regexp "$patterns"`
+lastpat=`echo "$patterns" | $NAWK '{print $NF}'`
+
+# Narrow down entries in advance that will be searched.
+substrpat=`echo "$patterns" | $SED 's/ /.*/g'`
+get_entry_list | $GREP $ignorecase "$substrpat" |
+$GREP -v $ignorecase "${substrpat}.*#" |
+sort -u -k 2 | sort -n -k 1,2 > $entrylist
+
+# Match by word.
+# arg: $1: pattern that matches words
+# If matches, show that entry(or entries) and exit.
+# If doesn't match, return to caller.
+match_word() {
+    pat="$1"
+    $GREP $ignorecase "$pat" $entrylist > $grepout
+    set `wc -l < $grepout`        # to remove white space
+    case $1 in
+      0)
+         return
+         ;;
+      1)
+         view_entry `cat $grepout`
+	 if [ "$cgioutput" -eq 0 ] ; then
+	     # Notify if any other candidates exist.
+	     $GREP -v $ignorecase "$pat" $entrylist > $grepout
+	     if [ `wc -l < $grepout` -ge 1 ] ; then
+		 show_candidates $grepout 'other possibilities'
+	     fi
+	 fi
+         clean_exit 0
+         ;;
+      *)
+         view_matchings $grepout 'Exact matchings'
+	 if [ "$cgioutput" -eq 0 ] ; then
+	     $GREP -v $ignorecase "$pat" $entrylist > $grepout
+	     if [ `wc -l < $grepout` -ge 1 ] ; then
+		 show_candidates $grepout 'other possibilities'
+	     fi
+	 fi
+         clean_exit 0
+         ;;
+    esac
+}
+
+# Match by pattern.
+# arg: $1: pattern
+# If matches, show that entry(or entries) and exit.
+# If doesn't match, return to caller.
+match_pattern() {
+    pat="$1"
+    $GREP $ignorecase "$pat" $entrylist > $grepout
+    set `wc -l < $grepout`
+    case $1 in
+      0)
+         return
+         ;;
+      1)
+         view_entry `cat $grepout`
+	 if [ "$cgioutput" -eq 0 ] ; then
+	     # Notify if any other candidates exist.
+	     $GREP -v $ignorecase "$pat" $entrylist > $grepout
+	     if [ `wc -l < $grepout` -ge 1 ] ; then
+		 show_candidates $grepout 'other possibilities'
+	     fi
+	 fi
+         clean_exit 0
+         ;;
+      *)
+	 view_matchings $entrylist 'Candidates'
+         clean_exit 1
+         ;;
+    esac
+}
+
+# Pseudo heuristic search.
+# Basically, try from hard condition to soft one in order.
+wordpat=`echo "$patterns" | $SED "s, ,${WORD_SEP}\\\\\\\\(${WORD}${WORD_SEP}\\\\\\\\)*,g"`
+match_word "${WORD_BEGIN}${wordpat}\$"
+match_word "${WORD_BEGIN}${wordpat}${WORD_END}"
+if echo "$lastpat" | $GREP '#' > /dev/null; then
+    match_pattern "${substrpat}${WORD_END}"
+fi
+# Lastly, substring search.
+# We have the search result already in $entrylist.
+set `wc -l < $entrylist`        # to remove white space
+case $1 in
+    0)
+       echo 'No match found.'
+       clean_exit 1
+       ;;
+    1)
+       view_entry `cat $entrylist`
+       clean_exit 0
+       ;;
+    *)
+       view_matchings $entrylist 'Candidates'
+       clean_exit 1
+       ;;
+esac

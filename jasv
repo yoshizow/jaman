@@ -1,0 +1,300 @@
+#!/bin/sh
+# jasv - Java API Source/Manual Viewer
+# version 1.0.0
+#
+# Copyright (c) 2002-2012, MAKISE Yoshitaro. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person
+# obtaining a copy of this software and associated documentation files
+# (the "Software"), to deal in the Software without restriction,
+# including without limitation the rights to use, copy, modify, merge,
+# publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so,
+# subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+# BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+# ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+src_defaultpath=/usr/local/jdk/src.jar
+
+NAWK=gawk
+GREP=grep
+# Below can be both '\b'.
+# (if grep does not support '\<' '\>')
+WORD_BEGIN='\<'
+WORD_END='\>'
+
+quote_regexp() {
+    echo "$1" | sed 's/\./\\./'
+}
+
+absolute_path() {
+    case "$1" in
+        /*) echo "$1" ;;
+        *)  echo "`pwd`/$1" ;;
+    esac
+}
+
+browse() {
+    p=`absolute_path "$1"`
+    echo "showing $p ..."
+    mozilla -remote "openURL(file:$p#method_summary)" || { mozilla "$p" & }
+}
+
+# arg: $1: n
+# arg: $2: path
+nth_path() {
+    n=$1 ;  p=$2
+
+    old_IFS="$IFS" ; IFS=:
+    set x $p ; shift
+    IFS="$old_IFS"
+
+    eval d=\${$n}
+    test -n "$d" || d=.
+
+    echo "$d"
+}
+
+get_srcpath() {
+    echo ${JASVPATH:-$src_defaultpath}
+}
+
+src_usage() {
+    echo "usage: `basename $0` [-path <path>] [-i] [-r <regexp> | <pattern>]"
+}
+
+src_action_noarg() {
+    src_get_class_list | $NAWK '{ print $2 }' | ${PAGER:-less}
+}
+
+# Get list of classes.
+# Each line of the list is in the form like:
+# <index in path> <class name>
+src_get_class_list() {
+    cnt=1
+    old_IFS="$IFS" ; IFS=:
+    for dir in $srcpath; do
+        test -n "$dir" || dir=.
+
+        if [ -d "$dir" ] ; then
+            ( cd "$dir" ; find . -type f -name '*.java' -print ) |
+            $NAWK '{ sub(/\.java$/, "")
+                     sub(/^.\//, "")
+                     gsub(/\//, ".")
+                     print cnt, $0
+                   }' cnt=$cnt
+        elif [ -r "$dir" ] ; then
+            unzip -l "$dir" 2>/dev/null |
+            $NAWK '$4 ~ /\.java$/ {
+                     sub(/\.java$/, "", $4)
+                     gsub(/\//, ".", $4)
+                     print cnt, $4
+                   }' cnt=$cnt
+        fi
+
+        cnt=`expr $cnt + 1`
+    done | sort -k 2 | uniq -f 1
+    IFS="$old_IFS"
+}
+
+# View source code of specified class
+# arg: $1: index in search path
+#      $2: class name
+src_view_class() {
+    idx=$1
+    class=$2
+
+    dir="`nth_path $idx $srcpath`"
+
+    file="`echo $class | tr . /`.java"
+    if [ -d "$dir" ] ; then
+        ${PAGER:-less} "$dir/$file"
+    else
+        unzip -p $dir "$file" | ${PAGER:-less}
+    fi
+}
+
+clean_exit() {
+    rm -f $classlist $grepout ; exit $1
+}
+
+pattern=
+srcpath="`get_srcpath`"
+ignorecase=
+regexp=0
+while [ -n "$1" ] ; do
+    case "$1" in
+      -path)
+          shift
+          srcpath="$1"
+          if [ -z "$srcpath" ] ; then src_usage ; exit 2 ; fi
+          ;;
+      -i)
+          ignorecase=-i
+          ;;
+      -r)
+          if [ -n "$pattern" ] ; then src_usage ; exit 2 ; fi
+          regexp=1
+          shift
+          pattern="$1"
+          if [ -z "$pattern" ] ; then src_usage ; exit 2 ; fi
+          ;;
+      -*)
+          src_usage
+          exit 2
+          ;;
+      *)
+          if [ -n "$pattern" ] ; then src_usage ; exit 2 ; fi
+          pattern="$1"
+          ;;
+    esac
+    shift
+done
+
+if [ -z "$pattern" ] ; then
+    src_action_noarg
+    exit 2
+fi
+
+if [ "$regexp" -eq 0 ] ; then
+    if echo "$pattern" | $GREP '[^A-Za-z0-9.]' > /dev/null; then
+        echo "Bad pattern: $pattern" 1>&2
+        exit 2
+    fi
+fi
+
+classlist=/tmp/jasv.$$.1
+grepout=/tmp/jasv.$$.2
+trap "clean_exit 2" 1 2 3 15
+
+src_get_class_list > $classlist
+
+# Process regexp match here
+if [ "$regexp" -eq 1 ] ; then
+    $NAWK 'match($2, pattern)' pattern="$pattern" $classlist > $grepout
+    set `wc -l < $grepout`        # to remove white space
+    case $1 in
+      0)
+         echo 'No match found.'
+	 clean_exit 1
+         ;;
+      1)
+         src_view_class `cat $grepout`
+	 clean_exit 0
+         ;;
+      *)
+         echo 'Candidates are:'
+         $NAWK '{ print $2 }' $grepout
+	 clean_exit 1
+         ;;
+    esac
+fi
+
+# Proceed if not regexp match
+
+pattern=`quote_regexp "$pattern"`
+
+# Reduce search target in advance
+$GREP $ignorecase -e "$pattern" $classlist > $grepout
+mv $grepout $classlist
+
+# Match by word
+# arg: $1: pattern matching word
+# If match, show corresponding class and exit
+# If not match, return to caller
+match_word() {
+    pat="$1"
+    $GREP $ignorecase -e "$pat" $classlist > $grepout
+    set `wc -l < $grepout`        # to remove white space
+    case $1 in
+      0)
+         return
+         ;;
+      1)
+         src_view_class `cat $grepout`
+         # If there are other candidates, note about that
+         $GREP -v $ignorecase -e "$pat" $classlist > $grepout
+         if [ `wc -l < $grepout` -ge 1 ] ; then
+             echo 'Other possibilities:'
+             $NAWK '{ print $2 }' $grepout
+         fi
+	 clean_exit 0
+         ;;
+      *)
+         echo 'Exact matchings:'
+         $NAWK '{ print $2 }' $grepout
+         $GREP -v $ignorecase -e "$pat" $classlist > $grepout
+         if  [ `wc -l < $grepout` -ge 1 ] ; then
+             echo 'Other possibilities:'
+             $NAWK '{ print $2 }' $grepout
+         fi
+	 clean_exit 1
+         ;;
+    esac
+}
+
+# Match by pattern
+# arg: $1: pattern
+# If match, show corresponding class and exit
+# If not match, return to caller
+match_pattern() {
+    pat="$1"
+    $GREP $ignorecase -e "$pat" $classlist > $grepout
+    set `wc -l < $grepout`
+    case $1 in
+      0)
+         return
+         ;;
+      1)
+         src_view_class `cat $grepout`
+         # If there are other candidates, note about that
+         $GREP -v $ignorecase -e "$pat" $classlist > $grepout
+         if [ `wc -l < $grepout` -ge 1 ] ; then
+             echo 'Other possibilities:'
+             $NAWK '{ print $2 }' $grepout
+         fi
+	 clean_exit 0
+         ;;
+      *)
+         echo 'Candidates are:'
+         $NAWK '{ print $2 }' $classlist
+	 clean_exit 1
+         ;;
+    esac
+}
+
+# Pseudo heuristic search.
+# Basically, try from hard condition to soft one in order.
+match_word "${WORD_BEGIN}${pattern}\$"
+match_word "${WORD_BEGIN}${pattern}${WORD_END}"
+if echo "$pattern" | $GREP '\.' > /dev/null; then
+    match_pattern "${pattern}${WORD_END}"
+fi
+# Lastly, substring search.
+# We have the search result already in $entrylist.
+set `wc -l < $classlist`        # to remove white space
+case $1 in
+    0)
+       echo 'No match found.'
+       clean_exit 1
+       ;;
+    1)
+       src_view_class `cat $classlist`
+       clean_exit 0
+       ;;
+    *)
+       echo 'Candidates are:'
+       $NAWK '{ print $2 }' $classlist
+       clean_exit 1
+       ;;
+esac

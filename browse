@@ -1,0 +1,80 @@
+#!/bin/sh
+# browse .html file with appropriate browser
+
+absolute_path() {
+    case "$1" in
+        http:*|https:*|ftp:*|file:* | [A-Za-z]:*)
+                echo "$1" ;;
+        /*)     echo "$1" ;;
+        *)      echo "`pwd`/$1" ;;
+    esac
+}
+
+browse_win() {
+    case "$1" in
+        /*) url=`cygpath -w "$1"` ;;
+        *)  url="$1"
+    esac
+
+    if echo "$url" | grep -q '^file://.*#' ; then
+	browse_win_cscript "$url"
+    else
+	fiber "$url"
+    fi
+}
+
+browse_win_cscript() {
+    tmpjs=/tmp/browse_tmp_$$.js
+    cat <<'__EOF__' > $tmpjs
+var url = WScript.Arguments(0);
+var shell = WScript.CreateObject("Shell.Application");
+var windows = shell.windows();
+var win = false;
+for (var i = 0; i < windows.Count; i++) {
+    if (windows(i).FullName.toLowerCase().indexOf("iexplore.exe") > 0) {
+        win = windows(i);
+    }
+}
+if (!win) {
+    win = WScript.CreateObject("InternetExplorer.Application");
+}
+win.Visible = true;
+win.Navigate(url);
+__EOF__
+
+    cscript //Nologo "`cygpath -w $tmpjs`" "$url"
+    rm -f $tmpjs
+}
+
+browse_unix() {
+   # for Firefox
+   case "$1" in
+       /*) url="file:$1" ;;
+       *)  url="$1" ;;
+   esac
+
+   if [ -n "$DISPLAY" ] ; then
+       if type firefox >/dev/null; then
+	   firefox "$url" &
+       elif type google-chrome > /dev/null; then
+	   google-chrome "$url" &
+       else
+	   echo 'No browser found.' 1>&2
+       fi
+   elif [ "x$TERM" = "xdumb" ] ; then
+       echo dump to stdout...
+       w3m -dump "$url"
+   else
+       w3m "$url"
+   fi
+}
+
+url=`absolute_path "$1"`
+case "`uname`" in
+    CYGWIN*)
+        browse_win "$url"
+        ;;
+    *)
+        browse_unix "$url"
+        ;;
+esac
