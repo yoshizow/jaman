@@ -17,7 +17,7 @@ Java のソースコードを、クラス名を指定するだけでブラウズ
 ----
 
 <pre>
-jasv [-path <path>] [-i] [-r &lt;regexp&gt; | &lt;pattern&gt;]
+jasv [-path &lt;path&gt;] [-i] [-r &lt;regexp&gt; | &lt;pattern&gt;]
 options:
     -path    ソースコードの検索パスを指定する
     -r       正規表現マッチングを行なう
@@ -43,6 +43,8 @@ options:
  
       例: setenv JASVPATH /usr/local/jdk/src.jar:\
                           $HOME/myproject/src/java
+</pre>
+
 BUGS
 ----
 

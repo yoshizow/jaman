@@ -50,7 +50,7 @@ export JAMANPATH=/usr/local/jdk1.4/docs/ja/api:$HOME/doc/jdom/apidocs:/usr/local
 
 ### 基本的な使い方
 
-`jaman2` はコマンドラインから起動します。
+`jaman` はコマンドラインから起動します。
 
 クラス名やメンバ名の一部を表す文字列を渡すと、
 その文字列にマッチするクラス/メンバの javadoc ファイルをブラウザに表示します。
